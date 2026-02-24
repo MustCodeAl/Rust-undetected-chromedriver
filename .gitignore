@@ -2,3 +2,10 @@
 Cargo.lock
 chromedriver*
 *chromedriver
+.idea/vcs.xml
+.idea/Rust-undetected-chromedriver.iml
+.idea/modules.xml
+.idea/misc.xml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/copilot.data.migration.ask2agent.xml
+.DS_Store
