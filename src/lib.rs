@@ -1,321 +1,260 @@
 use rand::prelude::*;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
-use thirtyfour::{BrowserCapabilitiesHelper,ChromiumLikeCapabilities, DesiredCapabilities, WebDriver};
-use std::error::Error;
-use std::time::Duration;
-use thirtyfour::{prelude::ElementWaitable, By};
+            use std::error::Error;
+            use std::fs;
+            use std::path::Path;
+            use std::process::Command;
+            use std::time::Duration;
+            use thirtyfour::prelude::*;
+            use thirtyfour::{BrowserCapabilitiesHelper, ChromiumLikeCapabilities, DesiredCapabilities, WebDriver};
 
-/// Fetches a new ChromeDriver executable and patches it to prevent detection.
-/// Returns a WebDriver instance.
-pub async fn chrome() -> Result<WebDriver, Box<dyn std::error::Error>> {
-    let os = std::env::consts::OS;
-    if std::path::Path::new("chromedriver").exists()
-        || std::path::Path::new("chromedriver.exe").exists()
-    {
-        println!("ChromeDriver already exists!");
-    } else {
-        println!("ChromeDriver does not exist! Fetching...");
-        let client = reqwest::Client::new();
-        fetch_chromedriver(&client).await.expect("Failed to fetch ChromeDriver");
-    }
-    let chromedriver_executable = match os {
-        "linux" => "chromedriver_PATCHED",
-        "macos" => "chromedriver_PATCHED",
-        "windows" => "chromedriver_PATCHED.exe",
-        _ => panic!("Unsupported OS!"),
-    };
-    match !std::path::Path::new(chromedriver_executable).exists() {
-        true => {
-            println!("Starting ChromeDriver executable patch...");
-            let file_name = if cfg!(windows) {
-                "chromedriver.exe"
-            } else {
-                "chromedriver"
-            };
-            let f = std::fs::read(file_name).expect("Failed to read chromedriver file");
-            let mut new_chromedriver_bytes = f.clone();
-            let mut total_cdc = String::from("");
-            let mut cdc_pos_list = Vec::new();
-            let mut is_cdc_present = false;
-            let mut patch_ct = 0;
-            for i in 0..f.len() - 3 {
-                if "cdc_"
-                    == format!(
-                        "{}{}{}{}",
-                        f[i] as char,
-                        f[i + 1] as char,
-                        f[i + 2] as char,
-                        f[i + 3] as char
-                    )
-                    .as_str()
-                {
-                    for x in i + 4..i + 22 {
-                        total_cdc.push_str(&(f[x] as char).to_string());
+            /// Constants for driver filenames based on OS
+            const DRIVER_NAME: &str = if cfg!(windows) { "chromedriver.exe" } else { "chromedriver" };
+            const PATCHED_DRIVER_NAME: &str = if cfg!(windows) { "chromedriver_PATCHED.exe" } else { "chromedriver_PATCHED" };
+
+            /// Fetches a new ChromeDriver executable and patches it to prevent detection.
+            pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
+                if !Path::new(DRIVER_NAME).exists() {
+                    println!("ChromeDriver does not exist! Fetching...");
+                    fetch_chromedriver().await?;
+                } else {
+                    println!("ChromeDriver already exists!");
+                }
+
+                if !Path::new(PATCHED_DRIVER_NAME).exists() {
+                    patch_chromedriver()?;
+                } else {
+                    println!("Detected patched chromedriver executable!");
+                }
+
+                setup_driver_permissions()?;
+
+                let port = rand::rng().random_range(2000..5000);
+                start_driver_process(port)?;
+
+                connect_to_driver(port).await
+            }
+
+            fn patch_chromedriver() -> Result<(), Box<dyn Error>> {
+                println!("Starting ChromeDriver executable patch...");
+                let file_content = fs::read(DRIVER_NAME)?;
+                let mut new_content = file_content.clone();
+                let mut patch_count = 0;
+
+                // Search for "cdc_" pattern and replace subsequent bytes
+                for i in 0..file_content.len().saturating_sub(3) {
+                    if &file_content[i..i+4] == b"cdc_" {
+                        let mut rng = rand::rng();
+                        for x in i+4..i+22 {
+                            new_content[x] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[rng.random_range(0..52)];
+                        }
+                        patch_count += 1;
                     }
-                    is_cdc_present = true;
-                    cdc_pos_list.push(i);
-                    total_cdc = String::from("");
+                }
+
+                if patch_count > 0 {
+                    println!("Patched {} cdcs!", patch_count);
+                } else {
+                    println!("No cdcs were found!");
+                }
+
+                println!("Writing to binary file...");
+                fs::write(PATCHED_DRIVER_NAME, new_content)?;
+                println!("Successfully wrote patched executable to '{}'!", PATCHED_DRIVER_NAME);
+                Ok(())
+            }
+
+            fn setup_driver_permissions() -> Result<(), Box<dyn Error>> {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(PATCHED_DRIVER_NAME)?.permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(PATCHED_DRIVER_NAME, perms)?;
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let output = Command::new("codesign")
+                        .args(&["--force", "--sign", "-", PATCHED_DRIVER_NAME])
+                        .output()?;
+                    if !output.status.success() {
+                        eprintln!("codesign failed: {}", String::from_utf8_lossy(&output.stderr));
+                    }
+                }
+                Ok(())
+            }
+
+            fn start_driver_process(port: usize) -> Result<(), Box<dyn Error>> {
+                println!("Starting chromedriver...");
+                Command::new(format!("./{}", PATCHED_DRIVER_NAME))
+                    .arg(format!("--port={}", port))
+                    .spawn()?;
+                Ok(())
+            }
+
+            async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
+                let mut caps = DesiredCapabilities::chrome();
+                caps.set_no_sandbox()?;
+                caps.set_disable_dev_shm_usage()?;
+                caps.add_arg("--disable-blink-features=AutomationControlled")?;
+                caps.add_arg("window-size=960,540")?;
+                caps.add_arg("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36")?;
+                caps.add_arg("disable-infobars")?;
+                caps.insert_browser_option("excludeSwitches", ["enable-automation"])?;
+
+                for _ in 0..20 {
+                    // Standard way to connect using thirtyfour as documented
+                    if let Ok(driver) = WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await {
+                        return Ok(driver);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+
+                Err("Failed to create WebDriver".into())
+            }
+
+            async fn fetch_chromedriver() -> Result<(), Box<dyn Error>> {
+                let client = reqwest::Client::new();
+                let os = std::env::consts::OS;
+                let arch = std::env::consts::ARCH;
+                let installed_version = get_chrome_version(os).await?;
+
+                let download_url = if installed_version.as_str() >= "114" {
+                    get_new_chrome_url(&client, &installed_version, os, arch).await?
+                } else {
+                    get_legacy_chrome_url(&client, &installed_version, os, arch).await?
+                };
+
+                let resp = client.get(&download_url).send().await?.bytes().await?;
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(resp))?;
+
+                for i in 0..archive.len() {
+                    let mut file = archive.by_index(i)?;
+                    let outpath = file.mangled_name();
+
+                    if file.name().ends_with('/') {
+                        fs::create_dir_all(&outpath)?;
+                    } else {
+                        if let Some(p) = outpath.parent() {
+                            if !p.exists() {
+                                fs::create_dir_all(p)?;
+                            }
+                        }
+                        let file_name = outpath.file_name().ok_or("Invalid file name")?;
+                        let mut outfile = fs::File::create(file_name)?;
+                        std::io::copy(&mut file, &mut outfile)?;
+                    }
+                }
+                Ok(())
+            }
+
+            async fn get_new_chrome_url(client: &reqwest::Client, version: &str, os: &str, arch: &str) -> Result<String, Box<dyn Error>> {
+                let url = "https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone.json";
+                let json: serde_json::Value = client.get(url).send().await?.json().await?;
+                let full_version = json["milestones"][version]["version"].as_str().ok_or("Version not found")?;
+
+                let (platform, zip_name) = match (os, arch) {
+                    ("linux", _) => ("linux64", "chromedriver-linux64.zip"),
+                    ("windows", _) => ("win64", "chromedriver-win64.zip"),
+                    ("macos", "aarch64") => ("mac-arm64", "chromedriver-mac-arm64.zip"),
+                    ("macos", _) => ("mac-x64", "chromedriver-mac-x64.zip"),
+                    _ => return Err("Unsupported OS".into()),
+                };
+
+                Ok(format!("https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}", full_version, platform, zip_name))
+            }
+
+            async fn get_legacy_chrome_url(client: &reqwest::Client, version: &str, os: &str, arch: &str) -> Result<String, Box<dyn Error>> {
+                let url = format!("https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{}", version);
+                let latest_release = client.get(url).send().await?.text().await?;
+
+                let zip_name = match (os, arch) {
+                    ("linux", _) => "chromedriver_linux64.zip",
+                    ("windows", _) => "chromedriver_win32.zip",
+                    ("macos", "aarch64") => return Err("MacOS on Apple Silicon with < Chrome 114 not supported!".into()),
+                    ("macos", _) => "chromedriver_mac64.zip",
+                    _ => return Err("Unsupported OS".into()),
+                };
+
+                Ok(format!("https://chromedriver.storage.googleapis.com/{}/{}", latest_release, zip_name))
+            }
+
+            async fn get_chrome_version(os: &str) -> Result<String, Box<dyn Error>> {
+                println!("Getting installed Chrome version...");
+                let output = match os {
+                    "linux" => Command::new("/usr/bin/google-chrome").arg("--version").output()?,
+                    "macos" => Command::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").arg("--version").output()?,
+                    "windows" => Command::new("powershell").args(&["-c", "(Get-Item 'C:/Program Files/Google/Chrome/Application/chrome.exe').VersionInfo"]).output()?,
+                    _ => return Err("Unsupported OS".into()),
+                };
+
+                let version: String = String::from_utf8(output.stdout)?
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect::<String>()
+                    .split('.')
+                    .take(1)
+                    .collect();
+
+                if version.is_empty() {
+                    return Err("Could not determine Chrome version".into());
+                }
+
+                println!("Currently installed Chrome version: {}", version);
+                Ok(version)
+            }
+
+            #[async_trait::async_trait]
+            pub trait Chrome {
+                async fn new() -> Self;
+                async fn bypass_cloudflare(&self, url: &str) -> Result<(), Box<dyn Error>>;
+                async fn borrow(&self) -> &WebDriver;
+                async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>>;
+            }
+
+            #[async_trait::async_trait]
+            impl Chrome for WebDriver {
+                async fn new() -> WebDriver {
+                    chrome().await.expect("Failed to create Chrome driver")
+                }
+
+                async fn bypass_cloudflare(&self, url: &str) -> Result<(), Box<dyn Error>> {
+                    let driver = self.borrow().await;
+                    // Navigation
+                    driver.goto(url).await?;
+
+                    // Frame switching
+                    driver.enter_frame(0).await?;
+
+                    let button = driver.find(By::XPath("/html/body//div/div[1]/div[1]/div/label/input")).await?;
+                    button.wait_until().clickable().await?;
+
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    button.click().await?;
+                    Ok(())
+                }
+
+                async fn borrow(&self) -> &WebDriver {
+                    self
+                }
+
+                async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>> {
+                    let driver = self.borrow().await;
+
+                    // Execute script to open new window
+                    driver.execute(&format!(r#"window.open("{}", "_blank");"#, url), vec![]).await?;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+
+                    let windows = driver.windows().await?;
+                    if let Some(first_window) = windows.first() {
+                        driver.switch_to_window(first_window.clone()).await?;
+                        driver.close_window().await?;
+                    }
+
+                    let windows = driver.windows().await?;
+                    if let Some(last_window) = windows.last() {
+                        driver.switch_to_window(last_window.clone()).await?;
+                    }
+                    Ok(())
                 }
             }
-            match is_cdc_present {
-                true => println!("Found cdcs!"),
-                false => println!("No cdcs were found!"),
-            }
-             let get_random_char = || -> char {
-                let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-                charset[rand::rng().random_range(0..52)] as char
-            };
-
-            for i in cdc_pos_list {
-                for x in i + 4..i + 22 {
-                    new_chromedriver_bytes[x] = get_random_char() as u8;
-                }
-                patch_ct += 1;
-            }
-            println!("Patched {} cdcs!", patch_ct);
-
-            println!("Starting to write to binary file...");
-            let _file = std::fs::File::create(chromedriver_executable).expect("Failed to create patched chromedriver executable");
-            match std::fs::write(chromedriver_executable, new_chromedriver_bytes) {
-                Ok(_res) => {
-                    println!("Successfully wrote patched executable to 'chromedriver_PATCHED'!",)
-                }
-                Err(err) => println!("Error when writing patch to file! Error: {}", err),
-            };
-        }
-        false => {
-            println!("Detected patched chromedriver executable!");
-        }
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mut perms = std::fs::metadata(chromedriver_executable)
-            .expect("Failed to get metadata of chromedriver executable")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(chromedriver_executable, perms).expect("Failed to set permissions");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("codesign")
-            .arg("--force")
-            .arg("--sign")
-            .arg("-")
-            .arg(chromedriver_executable)
-            .output()
-            .expect("Failed to run codesign");
-        if !output.status.success() {
-            eprintln!(
-                "codesign failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-    println!("Starting chromedriver...");
-    let port: usize = rand::rng().random_range(2000..5000);
-    Command::new(format!("./{}", chromedriver_executable))
-        .arg(format!("--port={}", port))
-        .spawn()
-        .expect("Failed to start chromedriver!");
-    let mut caps = DesiredCapabilities::chrome();
-    caps.set_no_sandbox().expect("Failed to set no sandbox capability");
-    caps.set_disable_dev_shm_usage().expect("Failed to set disable dev shm usage capability");
-    caps.add_arg("--disable-blink-features=AutomationControlled")
-        .expect("Failed to add disable blink features argument");
-    caps.add_arg("window-size=960,540").expect("Failed to add window size argument");
-    caps.add_arg("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36").expect("Failed to add user agent argument");
-    caps.add_arg("disable-infobars").expect("Failed to add disable infobars argument");
-    caps.insert_browser_option("excludeSwitches", ["enable-automation"])
-        .expect("Failed to insert browser option");
-    let mut driver = None;
-    let mut attempt = 0;
-    while driver.is_none() && attempt < 20 {
-        attempt += 1;
-        match WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await {
-            Ok(d) => driver = Some(d),
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
-        }
-    }
-    let driver = driver.expect("Failed to create WebDriver");
-    Ok(driver)
-}
-
-async fn fetch_chromedriver(client: &reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let installed_version = get_chrome_version(os).await?;
-    let chromedriver_url: String;
-    if installed_version.as_str() >= "114" {
-        // Fetch the correct version
-        let url = "https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone.json";
-        let resp = client.get(url).send().await?;
-        let body = resp.bytes().await?;
-        let json = serde_json::from_slice::<serde_json::Value>(&body)?;
-        let version = json["milestones"][installed_version]["version"]
-            .as_str()
-            .expect("Failed to extract version from JSON");
-        // Fetch the chromedriver binary
-        chromedriver_url = match (os, arch) {
-            ("linux", _) => format!(
-                "https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}",
-                version, "linux64", "chromedriver-linux64.zip"
-            ),
-            ("windows", _) => format!(
-                "https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}",
-                version, "win64", "chromedriver-win64.zip"
-            ),
-            ("macos", "aarch64") => format!(
-                "https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}",
-                version, "mac-arm64", "chromedriver-mac-arm64.zip"
-            ),
-            ("macos", _) => format!(
-                "https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}",
-                version, "mac-x64", "chromedriver-mac-x64.zip"
-            ),
-            _ => panic!("Unsupported OS!"),
-        };
-    } else {
-        let resp = client
-            .get(format!(
-                "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{}",
-                installed_version
-            ))
-            .send()
-            .await?;
-        let body = resp.text().await?;
-        chromedriver_url = match (os, arch) {
-            ("linux", _) => format!(
-                "https://chromedriver.storage.googleapis.com/{}/chromedriver_linux64.zip",
-                body
-            ),
-            ("windows", _) => format!(
-                "https://chromedriver.storage.googleapis.com/{}/chromedriver_win32.zip",
-                body
-            ),
-            ("macos", "aarch64") => panic!("MacOS on Apple Silicon with < Chrome 114 not supported!"),
-            ("macos", _) => format!(
-                "https://chromedriver.storage.googleapis.com/{}/chromedriver_mac64.zip",
-                body
-            ),
-            _ => panic!("Unsupported OS!"),
-        };
-    }
-
-    let resp = client.get(&chromedriver_url).send().await?;
-    let body = resp.bytes().await?;
-
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(body))?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = file.mangled_name();
-        if file.name().ends_with('/') {
-            std::fs::create_dir_all(&outpath)?;
-        } else {
-            let outpath_relative = outpath.file_name().expect("Failed to get file name");
-            let mut outfile = std::fs::File::create(outpath_relative)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-    Ok(())
-}
-
-async fn get_chrome_version(os: &str) -> Result<String, Box<dyn std::error::Error>> {
-    println!("Getting installed Chrome version...");
-    let command = match os {
-        "linux" => Command::new("/usr/bin/google-chrome")
-            .arg("--version")
-            .output()?,
-        "macos" => Command::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-            .arg("--version")
-            .output()?,
-        "windows" => Command::new("powershell")
-            .arg("-c")
-            .arg("(Get-Item 'C:/Program Files/Google/Chrome/Application/chrome.exe').VersionInfo")
-            .output()?,
-        _ => panic!("Unsupported OS!"),
-    };
-    let output = String::from_utf8(command.stdout)?;
-    
-    let version = output
-    .lines()
-    .flat_map(|line| line.chars().filter(|&ch| ch.is_ascii_digit()))
-    .take(3)
-    .collect::<String>();
-
-    println!("Currently installed Chrome version: {}", version);
-    Ok(version)
-}
-
-#[async_trait::async_trait]
-pub trait Chrome {
-    async fn new() -> Self;
-    async fn bypass_cloudflare(
-        &self,
-        url: &str,
-    ) -> Result<(), Box<dyn Error>>;
-    async fn borrow(&self) -> &WebDriver;
-    async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>>;
-}
-
-#[async_trait::async_trait]
-impl Chrome for WebDriver {
-    async fn new() -> WebDriver {
-        chrome().await.expect("Failed to create Chrome driver")
-    }
-
-    async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>> {
-        let driver = self.borrow().await;
-        driver
-            .execute(
-                &format!(r#"window.open("{}", "_blank");"#, url),
-                vec![],
-            )
-            .await?;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        let first_window = driver
-        .windows()
-        .await?
-        .first()
-        .expect("Unable to get first windows")
-        .clone();
-
-        driver.switch_to_window(first_window).await?;
-        driver.close_window().await?;
-        let first_window = driver
-            .windows()
-            .await?
-            .last()
-            .expect("Unable to get last windows")
-            .clone();
-        driver.switch_to_window(first_window).await?;
-        Ok(())
-    }
-
-async fn bypass_cloudflare(
-    &self,
-    url: &str,
-) -> Result<(), Box<dyn Error>> {
-    let driver = self.borrow().await;
-    driver.goto(url).await?;
-
-    driver.enter_frame(0).await?;
-
-    let button = driver.find(By::XPath("/html/body//div/div[1]/div[1]/div/label/input")).await?;
-
-    button.wait_until().clickable().await?;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    button.click().await?;
-    Ok(())
-}
-
-async fn borrow(&self) -> &WebDriver {
-    self
-}
-
-}
