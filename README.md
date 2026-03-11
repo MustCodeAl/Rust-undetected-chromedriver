@@ -6,7 +6,7 @@
 A rust implementation of ultrafunkamsterdam's [undetected-chromedriver](https://github.com/ultrafunkamsterdam/undetected-chromedriver) library based on [thirtyfour](https://github.com/stevepryde/thirtyfour)
 
 
-# add more detection bypasses from [SeleniumBase](https://seleniumbase.io/help_docs/uc_mode/)
+TODO: add more detection bypasses and methods from [SeleniumBase UC Mode](https://seleniumbase.io/help_docs/uc_mode/)
 
 ## Installation
 
