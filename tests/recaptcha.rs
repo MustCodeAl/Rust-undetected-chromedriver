@@ -10,20 +10,31 @@ mod tests {
             .await
             .expect("Failed to navigate to recaptcha demo page");
 
-            let button = driver
+        let button = driver
             .query(By::XPath(r#"//*[@id="recaptcha-steps"]"#))
             .first()
             .await
             .expect("Failed to find the button element");
-        button.wait_until().clickable().await.expect("Failed to wait until button is clickable");
+        button
+            .wait_until()
+            .clickable()
+            .await
+            .expect("Failed to wait until button is clickable");
         button.click().await.expect("Failed to click the button");
         let response = driver
             .query(By::XPath(r#"//li[@class="step3"]"#))
             .first()
             .await
             .expect("Failed to query response element");
-        response.wait_until().displayed().await.expect("Failed to wait until response is displayed");
-        println!("response: {}", response.text().await.expect("Failed to get response text"));
+        response
+            .wait_until()
+            .displayed()
+            .await
+            .expect("Failed to wait until response is displayed");
+        println!(
+            "response: {}",
+            response.text().await.expect("Failed to get response text")
+        );
         let response_text = response.text().await.expect("Failed to get response text");
         let score = response_text
             .lines()

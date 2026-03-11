@@ -13,7 +13,13 @@ mod tests {
             .expect("Failed to navigate to headless detection page");
         let is_headless = driver.query(By::XPath(r#"//*[@id="res"]/p"#));
         assert_eq!(
-            is_headless.first().await.expect("Failed to find headless detection element").text().await.expect("Failed to get text of headless detection element"),
+            is_headless
+                .first()
+                .await
+                .expect("Failed to find headless detection element")
+                .text()
+                .await
+                .expect("Failed to get text of headless detection element"),
             "You are not Chrome headless"
         );
         driver.quit().await.expect("Failed to quit Chrome driver");
