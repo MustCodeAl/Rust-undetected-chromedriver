@@ -30,11 +30,29 @@ const PATCHED_DRIVER_NAME: &str = if cfg!(windows) {
     "chromedriver_PATCHED"
 };
 
-// ─── Persistent stealth scripts (Page.addScriptToEvaluateOnNewDocument) ───────
-// These fire before ANY page JS on every navigation, including cross-origin.
+// ─── Ad-block URL patterns (mirrors SeleniumBase's browser.py list) ───────────
+// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/browser.py#L433-L454
+const AD_BLOCK_PATTERNS: &[&str] = &[
+    "*.googlesyndication.com*", "*.googletagmanager.com*",
+    "*.google-analytics.com*",  "*.amazon-adsystem.com*",
+    "*.adsafeprotected.com*",   "*.doubleclick.net*",
+    "*.fastclick.net*",         "*.snigelweb.com*",
+    "*.2mdn.net*",              "*.casalemedia.com*",
+    "*.admanmedia.com*",        "*.quantserve.com*",
+    "*.bidswitch.net*",         "*.360yield.com*",
+    "*.adthrive.com*",          "*.pubmatic.com*",
+    "*.id5-sync.com*",          "*.moatads.com*",
+    "*.dotomi.com*",            "*.adsrvr.org*",
+    "*.adnxs.com*",             "*.openx.net*",
+    "*.tapad.com*",             "*.3lift.com*",
+];
 
-/// Hides webdriver flag, restores window.chrome, spoofs permissions/plugins/languages,
-/// and forces shadow roots open so nothing hides inside closed shadows.
+// ─── Persistent CDP stealth scripts ──────────────────────────────────────────
+// Registered via Page.addScriptToEvaluateOnNewDocument — fires before ANY page
+// JS on every navigation, including cross-origin ones.
+
+/// Hides webdriver flag, restores window.chrome, spoofs permissions/plugins/
+/// languages, and forces shadow roots open.
 /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L380-L401
 const STEALTH_SCRIPT: &str = r#"
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -120,7 +138,33 @@ const ADVANCED_FINGERPRINT_SCRIPT: &str = r#"
     })();
 "#;
 
-// ─── Internal: register all three persistent hooks via CDP ───────────────────
+// ─── ChromeConfig ─────────────────────────────────────────────────────────────
+
+/// Builder-style config for chrome_with_config().
+/// All fields are optional with sane stealth defaults.
+/// Mirrors SeleniumBase's SB(uc=True, headless=True, mobile=True, proxy=...) pattern.
+/// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/cdp_util.py#L278-L294
+#[derive(Debug, Clone, Default)]
+pub struct ChromeConfig {
+    /// Run in headless mode (--headless=new, Chrome ≥112).
+    pub headless: bool,
+    /// Enable mobile device emulation. Default metrics: 412×732 @ 3x.
+    pub mobile: bool,
+    /// Override mobile metrics: (css_width, css_height, pixel_ratio).
+    pub mobile_metrics: Option<(u32, u32, f64)>,
+    /// Override mobile user-agent string.
+    pub mobile_user_agent: Option<String>,
+    /// Block ad/tracker URLs via Network.setBlockedURLs on startup.
+    pub ad_block: bool,
+    /// Bypass Content Security Policy (Page.setBypassCSP).
+    pub disable_csp: bool,
+    /// Optional proxy: "host:port" or "user:pass@host:port".
+    pub proxy: Option<String>,
+    /// Language locale code, e.g. "en-US".
+    pub lang: Option<String>,
+}
+
+// ─── Internal: register all persistent CDP stealth hooks ─────────────────────
 
 async fn inject_all_persistent_stealth(driver: &WebDriver) -> Result<(), Box<dyn Error>> {
     let dt = ChromeDevTools::new(driver.handle.clone());
@@ -134,10 +178,11 @@ async fn inject_all_persistent_stealth(driver: &WebDriver) -> Result<(), Box<dyn
     Ok(())
 }
 
-// ─── Public entry point ───────────────────────────────────────────────────────
+// ─── Public entry points ──────────────────────────────────────────────────────
 
-/// Fetches, patches, and starts ChromeDriver. Returns a fully stealthed WebDriver.
-pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
+/// Full-featured entry point with config.
+/// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/cdp_util.py#L278-L294
+pub async fn chrome_with_config(config: ChromeConfig) -> Result<WebDriver, Box<dyn Error>> {
     if !Path::new(DRIVER_NAME).exists() {
         println!("ChromeDriver does not exist! Fetching...");
         fetch_chromedriver().await?;
@@ -156,33 +201,83 @@ pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
     let port = rand::rng().random_range(2000..5000);
     start_driver_process(port)?;
 
-    let driver = connect_to_driver(port).await?;
+    let driver = connect_to_driver_with_config(port, &config).await?;
+    let dt = ChromeDevTools::new(driver.handle.clone());
 
+    // Persistent stealth hooks
     inject_all_persistent_stealth(&driver).await?;
 
-    // Grant all permissions upfront — permission prompts are a bot-detection signal.
+    // Grant all permissions upfront — prompts are a bot-detection signal.
     // Ref: https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-grantPermissions
-    let _ = ChromeDevTools::new(driver.handle.clone())
-        .execute_cdp_with_params(
-            "Browser.grantPermissions",
-            json!({
-                "permissions": [
-                    "geolocation","notifications","audioCapture","videoCapture",
-                    "clipboardReadWrite","clipboardSanitizedWrite","midi","midiSysex",
-                    "sensors","backgroundSync","backgroundFetch","nfc","displayCapture",
-                    "storageAccess","protectedMediaIdentifier","idleDetection"
-                ]
-            }),
-        )
-        .await;
+    let _ = dt.execute_cdp_with_params(
+        "Browser.grantPermissions",
+        json!({
+            "permissions": [
+                "geolocation","notifications","audioCapture","videoCapture",
+                "clipboardReadWrite","clipboardSanitizedWrite","midi","midiSysex",
+                "sensors","backgroundSync","backgroundFetch","nfc","displayCapture",
+                "storageAccess","protectedMediaIdentifier","idleDetection"
+            ]
+        }),
+    ).await;
+
+    // Mobile device metrics override
+    // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L6058-L6074
+    if config.mobile {
+        let (w, h, dpr) = config.mobile_metrics.unwrap_or((412, 732, 3.0));
+        let _ = dt.execute_cdp_with_params(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": w, "height": h, "deviceScaleFactor": dpr, "mobile": true }),
+        ).await;
+        let _ = dt.execute_cdp_with_params(
+            "Emulation.setTouchEmulationEnabled",
+            json!({ "enabled": true, "maxTouchPoints": 5 }),
+        ).await;
+    }
+
+    // Ad/tracker URL blocking
+    // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/browser.py#L433-L454
+    if config.ad_block {
+        let _ = dt.execute_cdp("Network.enable").await;
+        let _ = dt.execute_cdp_with_params(
+            "Network.setBlockedURLs",
+            json!({ "urls": AD_BLOCK_PATTERNS }),
+        ).await;
+    }
+
+    // Bypass CSP — required for JS injection on strict sites
+    // Ref: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-setBypassCSP
+    if config.disable_csp {
+        let _ = dt.execute_cdp_with_params(
+            "Page.setBypassCSP",
+            json!({ "enabled": true }),
+        ).await;
+    }
+
+    // Authenticated proxy header injection
+    if let Some(ref proxy) = config.proxy {
+        if proxy.contains('@') {
+            let creds = proxy.split('@').next().unwrap_or("");
+            let encoded = general_purpose::STANDARD.encode(creds);
+            let _ = dt.execute_cdp("Network.enable").await;
+            let _ = dt.execute_cdp_with_params(
+                "Network.setExtraHTTPHeaders",
+                json!({ "headers": { "Proxy-Authorization": format!("Basic {}", encoded) } }),
+            ).await;
+        }
+    }
 
     Ok(driver)
 }
 
-// ─── Public free functions ────────────────────────────────────────────────────
+/// Zero-config entry point — backward-compatible with existing callers.
+pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
+    chrome_with_config(ChromeConfig::default()).await
+}
+
+// ─── Public reconnect helper ──────────────────────────────────────────────────
 
 /// Canonical CF/bot bypass: window.open in new tab → full quit → sleep → reconnect.
-/// This is the gold-standard pattern from SeleniumBase UC Mode.
 /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L587-L633
 pub async fn uc_open_with_reconnect(
     driver: &WebDriver,
@@ -216,15 +311,15 @@ pub async fn uc_open_with_reconnect(
 pub trait Chrome {
     // ── Stealth ──────────────────────────────────────────────────────────────
 
-    /// Scrub CDC props from the current page context (runtime, not persistent).
+    /// Scrub CDC props from the current page context (runtime).
     async fn remove_cdc_props(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Re-inject all persistent CDP stealth hooks (call after a manual reconnect).
+    /// Re-inject all persistent CDP stealth hooks (call after manual reconnect).
     async fn inject_persistent_stealth(&self) -> Result<(), Box<dyn Error>>;
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
-    /// Create a new fully stealthed driver instance.
+    /// Create a new fully stealthed driver with default config.
     async fn new() -> Self;
 
     // ── Navigation ───────────────────────────────────────────────────────────
@@ -232,16 +327,14 @@ pub trait Chrome {
     /// Navigate with pre/post CDC scrub.
     async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Alias for goto — explicit scrub-navigate-scrub.
+    /// Alias for goto.
     async fn uc_get(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Open URL in a new tab, close the original tab.
-    /// Avoids direct-navigation fingerprinting.
+    /// Open URL in a new tab, close the original.
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L561-L576
     async fn uc_open_with_tab(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Open url in new tab → drop WebDriver connection → sleep → reconnect.
-    /// Lighter than uc_open_with_reconnect (chromedriver process stays alive).
+    /// Open url in new tab → quit session → sleep → reconnect.
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L634-L662
     async fn uc_open_with_disconnect(
         &self,
@@ -251,10 +344,10 @@ pub trait Chrome {
         caps: thirtyfour::ChromeCapabilities,
     ) -> Result<WebDriver, Box<dyn Error>>;
 
-    /// Navigate back in history with pre/post CDC scrub.
+    /// Navigate back with pre/post CDC scrub.
     async fn go_back(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Navigate forward in history with pre/post CDC scrub.
+    /// Navigate forward with pre/post CDC scrub.
     async fn go_forward(&self) -> Result<(), Box<dyn Error>>;
 
     // ── Interaction ──────────────────────────────────────────────────────────
@@ -263,33 +356,31 @@ pub trait Chrome {
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L655
     async fn uc_click(&self, css_selector: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Bypass a Cloudflare Turnstile challenge at the given URL.
+    /// Bypass a Cloudflare Turnstile challenge.
     async fn bypass_cloudflare(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
     // ── DOM helpers ──────────────────────────────────────────────────────────
 
-    /// Returns the full page HTML (outerHTML of <html>).
+    /// Full page HTML (outerHTML of <html>).
     async fn get_page_source(&self) -> Result<String, Box<dyn Error>>;
 
-    /// Returns true if the CSS selector matches any element in the DOM.
+    /// True if the CSS selector matches any element in the DOM.
     async fn is_element_present(&self, css_selector: &str) -> bool;
 
-    /// Returns true if the CSS selector matches a visible (non-zero-size) element.
+    /// True if the CSS selector matches a visible (non-zero-size) element.
     async fn is_element_visible(&self, css_selector: &str) -> bool;
 
-    /// Rewrites all target="_blank" links to target="_self".
-    /// Stops new-tab navigations from leaking automation signals.
+    /// Rewrite all target="_blank" links to target="_self".
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/sb_cdp.py#L1736-L1738
     async fn internalize_links(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Opens a new browser window at the given URL.
+    /// Open a new browser window at the given URL.
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L421-L428
     async fn window_new(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
     // ── CDP overrides ────────────────────────────────────────────────────────
 
     /// Override User-Agent at the CDP Network layer.
-    /// Survives both JS navigator.userAgent checks and HTTP request headers.
     /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride
     async fn set_user_agent(&self, ua: &str) -> Result<(), Box<dyn Error>>;
 
@@ -308,16 +399,47 @@ pub trait Chrome {
     async fn grant_all_permissions(&self) -> Result<(), Box<dyn Error>>;
 
     /// Enable CDP Network + Log domains for request/event capture.
-    /// Mirrors Python's enable_cdp_events=True.
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L175-L183
     async fn enable_cdp_log_capture(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Take a lossless PNG screenshot via CDP Page.captureScreenshot.
-    /// Works in headless and offscreen modes.
+    /// Lossless PNG screenshot via CDP Page.captureScreenshot.
     /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-captureScreenshot
     async fn cdp_screenshot(&self) -> Result<Vec<u8>, Box<dyn Error>>;
 
-    // ── Cookies ───────────────────────���──────────────────────────────────────
+    /// Print current page to PDF bytes via CDP Page.printToPDF.
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-printToPDF
+    async fn print_to_pdf(&self) -> Result<Vec<u8>, Box<dyn Error>>;
+
+    // ── Mobile emulation ─────────────────────────────────────────────────────
+
+    /// Enable mobile device emulation at runtime (post-startup).
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride
+    async fn set_mobile_emulation(
+        &self,
+        width: u32,
+        height: u32,
+        pixel_ratio: f64,
+    ) -> Result<(), Box<dyn Error>>;
+
+    // ── Network control ──────────────────────────────────────────────────────
+
+    /// Block ad/tracker URLs via CDP Network.setBlockedURLs.
+    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/browser.py#L433-L454
+    async fn enable_ad_block(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Block a custom list of URL glob patterns.
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setBlockedURLs
+    async fn block_urls(&self, patterns: &[&str]) -> Result<(), Box<dyn Error>>;
+
+    /// Bypass Content Security Policy — needed for JS injection on strict sites.
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-setBypassCSP
+    async fn disable_csp(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Inject Proxy-Authorization at the CDP Network layer.
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setExtraHTTPHeaders
+    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>>;
+
+    // ── Cookies ──────────────────────────────────────────────────────────────
 
     /// Get all cookies as a JSON array via CDP Network.getAllCookies.
     async fn get_all_cookies(&self) -> Result<Value, Box<dyn Error>>;
@@ -327,13 +449,6 @@ pub trait Chrome {
 
     /// Clear all cookies via CDP Network.clearBrowserCookies.
     async fn clear_cookies(&self) -> Result<(), Box<dyn Error>>;
-
-    // ── Proxy ────────────────────────────────────────────────────────────────
-
-    /// Inject Proxy-Authorization at the CDP Network layer.
-    /// Handles authenticated proxies ("user:pass@host:port") after driver start.
-    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setExtraHTTPHeaders
-    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>>;
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
@@ -363,8 +478,7 @@ impl Chrome for WebDriver {
     // ── goto ──────────────────────────────────────────────────────────────────
     async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>> {
         let _ = self.remove_cdc_props().await;
-        // Check for live CDC props and delete them before navigating
-        // Mirrors Python's _get_cdc_props + _hook_remove_cdc_props
+        // Check + delete any live CDC props before navigating
         // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L365-L394
         let check = r#"
             let o=window,r=[];
@@ -396,16 +510,13 @@ impl Chrome for WebDriver {
     // ── uc_open_with_tab ──────────────────────────────────────────────────────
     async fn uc_open_with_tab(&self, url: &str) -> Result<(), Box<dyn Error>> {
         let _ = self.remove_cdc_props().await;
-        self.execute(&format!(r#"window.open("{}","_blank");"#, url), vec![])
-            .await?;
+        self.execute(&format!(r#"window.open("{}","_blank");"#, url), vec![]).await?;
         time::sleep(Duration::from_millis(500)).await;
-        // Close the original tab
         let handles = self.windows().await?;
         if let Some(original) = handles.first() {
             self.switch_to_window(original.clone()).await?;
             self.close_window().await?;
         }
-        // Switch to new tab
         let handles = self.windows().await?;
         if let Some(last) = handles.last() {
             self.switch_to_window(last.clone()).await?;
@@ -415,8 +526,6 @@ impl Chrome for WebDriver {
     }
 
     // ── uc_open_with_disconnect ───────────────────────────────────────────────
-    // Opens url in new tab then reconnects after timeout_secs.
-    // chromedriver process stays alive — only the WebDriver session is dropped.
     async fn uc_open_with_disconnect(
         &self,
         url: &str,
@@ -428,7 +537,6 @@ impl Chrome for WebDriver {
         let _ = self
             .execute(&format!(r#"window.open("{}","_blank");"#, url), vec![])
             .await;
-        // Quit just the session (the chromedriver process keeps running on `port`)
         let _ = self.clone().quit().await;
         time::sleep(Duration::from_secs_f64(timeout_secs)).await;
         for _ in 0..20 {
@@ -484,9 +592,7 @@ impl Chrome for WebDriver {
         self.goto(url).await?;
         self.enter_frame(0).await?;
         let button = self
-            .find(By::XPath(
-                "/html/body//div/div[1]/div[1]/div/label/input",
-            ))
+            .find(By::XPath("/html/body//div/div[1]/div[1]/div/label/input"))
             .await?;
         button.wait_until().clickable().await?;
         time::sleep(Duration::from_secs(2)).await;
@@ -552,16 +658,12 @@ impl Chrome for WebDriver {
         Ok(())
     }
 
-    // ── set_user_agent ─────���──────────────────────────────────────────────────
+    // ── set_user_agent ────────────────────────────────────────────────────────
     async fn set_user_agent(&self, ua: &str) -> Result<(), Box<dyn Error>> {
         ChromeDevTools::new(self.handle.clone())
             .execute_cdp_with_params(
                 "Network.setUserAgentOverride",
-                json!({
-                    "userAgent":      ua,
-                    "acceptLanguage": "en-US,en;q=0.9",
-                    "platform":       "Win32"
-                }),
+                json!({ "userAgent": ua, "acceptLanguage": "en-US,en;q=0.9", "platform": "Win32" }),
             )
             .await?;
         Ok(())
@@ -627,6 +729,80 @@ impl Chrome for WebDriver {
         Ok(general_purpose::STANDARD.decode(b64)?)
     }
 
+    // ── print_to_pdf ──────────────────────────────────────────────────────────
+    async fn print_to_pdf(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        let r = ChromeDevTools::new(self.handle.clone())
+            .execute_cdp_with_params(
+                "Page.printToPDF",
+                json!({ "printBackground": true, "preferCSSPageSize": true }),
+            )
+            .await?;
+        let b64 = r["data"].as_str().ok_or("Missing PDF data")?;
+        Ok(general_purpose::STANDARD.decode(b64)?)
+    }
+
+    // ── set_mobile_emulation ──────────────────────────────────────────────────
+    async fn set_mobile_emulation(
+        &self,
+        width: u32,
+        height: u32,
+        pixel_ratio: f64,
+    ) -> Result<(), Box<dyn Error>> {
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp_with_params(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": width, "height": height, "deviceScaleFactor": pixel_ratio, "mobile": true }),
+        )
+            .await?;
+        dt.execute_cdp_with_params(
+            "Emulation.setTouchEmulationEnabled",
+            json!({ "enabled": true, "maxTouchPoints": 5 }),
+        )
+            .await?;
+        Ok(())
+    }
+
+    // ── enable_ad_block ───────────────────────────────────────────────────────
+    async fn enable_ad_block(&self) -> Result<(), Box<dyn Error>> {
+        self.block_urls(AD_BLOCK_PATTERNS).await
+    }
+
+    // ── block_urls ────────────────────────────────────────────────────────────
+    async fn block_urls(&self, patterns: &[&str]) -> Result<(), Box<dyn Error>> {
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp("Network.enable").await?;
+        dt.execute_cdp_with_params(
+            "Network.setBlockedURLs",
+            json!({ "urls": patterns }),
+        )
+            .await?;
+        Ok(())
+    }
+
+    // ── disable_csp ───────────────────────────────────────────────────────────
+    async fn disable_csp(&self) -> Result<(), Box<dyn Error>> {
+        ChromeDevTools::new(self.handle.clone())
+            .execute_cdp_with_params("Page.setBypassCSP", json!({ "enabled": true }))
+            .await?;
+        Ok(())
+    }
+
+    // ── set_proxy ─────────────────────────────────────────────────────────────
+    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>> {
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp("Network.enable").await?;
+        if proxy.contains('@') {
+            let creds = proxy.split('@').next().unwrap_or("");
+            let encoded = general_purpose::STANDARD.encode(creds);
+            dt.execute_cdp_with_params(
+                "Network.setExtraHTTPHeaders",
+                json!({ "headers": { "Proxy-Authorization": format!("Basic {}", encoded) } }),
+            )
+                .await?;
+        }
+        Ok(())
+    }
+
     // ── get_all_cookies ───────────────────────────────────────────────────────
     async fn get_all_cookies(&self) -> Result<Value, Box<dyn Error>> {
         let r = ChromeDevTools::new(self.handle.clone())
@@ -651,22 +827,6 @@ impl Chrome for WebDriver {
         ChromeDevTools::new(self.handle.clone())
             .execute_cdp_with_params("Network.clearBrowserCookies", json!({}))
             .await?;
-        Ok(())
-    }
-
-    // ── set_proxy ��────────────────────────────────────────────────────────────
-    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>> {
-        let dt = ChromeDevTools::new(self.handle.clone());
-        dt.execute_cdp("Network.enable").await?;
-        if proxy.contains('@') {
-            let creds = proxy.split('@').next().unwrap_or("");
-            let encoded = general_purpose::STANDARD.encode(creds);
-            dt.execute_cdp_with_params(
-                "Network.setExtraHTTPHeaders",
-                json!({ "headers": { "Proxy-Authorization": format!("Basic {}", encoded) } }),
-            )
-                .await?;
-        }
         Ok(())
     }
 
@@ -765,19 +925,20 @@ fn merge_json(a: &mut Value, b: Value) {
     }
 }
 
-async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
+async fn connect_to_driver_with_config(
+    port: usize,
+    config: &ChromeConfig,
+) -> Result<WebDriver, Box<dyn Error>> {
     let mut caps = DesiredCapabilities::chrome();
 
     caps.set_no_sandbox()?;
     caps.set_disable_dev_shm_usage()?;
     caps.add_arg("--disable-blink-features=AutomationControlled")?;
-    caps.add_arg("window-size=960,540")?;
     caps.add_arg("--disable-infobars")?;
     caps.add_arg("--no-default-browser-check")?;
     caps.add_arg("--no-first-run")?;
     caps.add_arg("--no-service-autorun")?;
     caps.add_arg("--password-store=basic")?;
-    caps.add_arg("--profile-directory=Default")?;
     caps.add_arg("--no-pings")?;
     caps.add_arg("--homepage=about:blank")?;
     caps.add_arg("--safebrowsing-disable-download-protection")?;
@@ -790,26 +951,48 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
     caps.add_arg("--disable-translate")?;
     caps.add_arg("--disable-search-engine-choice-screen")?;
     caps.add_arg("--enable-unsafe-extension-debugging")?;
-    caps.add_arg("--lang=en-US,en;q=0.9")?;
     caps.add_arg("--disable-background-timer-throttling")?;
     caps.add_arg("--disable-backgrounding-occluded-windows")?;
     caps.add_arg("--disable-renderer-backgrounding")?;
     caps.add_arg("--disable-features=IsolateOrigins,site-per-process,Translate,InsecureDownloadWarnings,DownloadBubble,DownloadBubbleV2,OptimizationTargetPrediction,OptimizationGuideModelDownloading,SidePanelPinning,UserAgentClientHint,PrivacySandboxSettings4,ComponentUpdater")?;
 
-    let os = std::env::consts::OS;
-    let user_agent = match os {
-        "windows" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "macos"   => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        _         => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    if config.headless {
+        caps.add_arg("--headless=new")?;
+        caps.add_arg("--window-size=1920,1080")?;
+    } else {
+        caps.add_arg("window-size=960,540")?;
+    }
+
+    let lang = config.lang.as_deref().unwrap_or("en-US");
+    caps.add_arg(&format!("--lang={},en;q=0.9", lang))?;
+
+    let user_agent = if config.mobile {
+        config.mobile_user_agent.clone().unwrap_or_else(|| {
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36".to_string()
+        })
+    } else {
+        let os = std::env::consts::OS;
+        match os {
+            "windows" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "macos"   => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            _         => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }.to_string()
     };
     caps.add_arg(&format!("--user-agent={}", user_agent))?;
 
-    // Temp profile — avoids wire-fingerprinting from reused profiles
+    if let Some(ref proxy) = config.proxy {
+        let host_port = if proxy.contains('@') {
+            proxy.split('@').last().unwrap_or(proxy.as_str())
+        } else {
+            proxy.as_str()
+        };
+        caps.add_arg(&format!("--proxy-server={}", host_port))?;
+    }
+
     let temp_dir = tempfile::Builder::new().prefix("uc_").tempdir()?;
     let profile_path = temp_dir.path().to_path_buf();
     caps.add_arg(&format!("--user-data-dir={}", profile_path.display()))?;
 
-    // Write stealth Preferences directly to disk before Chrome reads them
     let default_path = profile_path.join("Default");
     fs::create_dir_all(&default_path)?;
     let prefs_file = default_path.join("Preferences");
@@ -820,7 +1003,6 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
         insert_nested_pref(map, "profile.password_manager_enabled",        Value::Bool(false));
         insert_nested_pref(map, "profile.password_manager_leak_detection", Value::Bool(false));
         insert_nested_pref(map, "profile.exit_type",                       Value::Null);
-        // WebRTC leak prevention
         insert_nested_pref(map, "webrtc.ip_handling_policy",    Value::String("disable_non_proxied_udp".into()));
         insert_nested_pref(map, "webrtc.multiple_routes_enabled", Value::Bool(false));
         insert_nested_pref(map, "webrtc.nonproxied_udp_enabled",  Value::Bool(false));
@@ -840,12 +1022,17 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
         if let Ok(driver) =
             WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await
         {
-            let _ = temp_dir.into_path(); // keep profile alive for the session
+            let _ = temp_dir.into_path();
             return Ok(driver);
         }
         time::sleep(Duration::from_millis(250)).await;
     }
     Err("Failed to create WebDriver".into())
+}
+
+// Kept for internal backward-compat
+async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
+    connect_to_driver_with_config(port, &ChromeConfig::default()).await
 }
 
 // ─── ChromeDriver download ────────────────────────────────────────────────────
@@ -934,12 +1121,10 @@ async fn get_legacy_chrome_url(
 async fn get_chrome_version(os: &str) -> Result<String, Box<dyn Error>> {
     println!("Getting installed Chrome version...");
     let out = match os {
-        "linux" => Command::new("/usr/bin/google-chrome")
-            .arg("--version").output()?,
-        "macos" => Command::new(
+        "linux"   => Command::new("/usr/bin/google-chrome").arg("--version").output()?,
+        "macos"   => Command::new(
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        )
-            .arg("--version").output()?,
+        ).arg("--version").output()?,
         "windows" => Command::new("powershell")
             .args(&[
                 "-c",
