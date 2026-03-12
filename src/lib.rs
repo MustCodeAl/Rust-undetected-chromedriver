@@ -23,167 +23,114 @@ const DRIVER_NAME: &str = if cfg!(windows) {
 } else {
     "chromedriver"
 };
+
 const PATCHED_DRIVER_NAME: &str = if cfg!(windows) {
     "chromedriver_PATCHED.exe"
 } else {
     "chromedriver_PATCHED"
 };
 
-// ─── Stealth: basic navigator/chrome/permissions spoof ───────────────────────
-// Injected via Page.addScriptToEvaluateOnNewDocument — fires before any page JS.
-// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L380-L401
-const STEALTH_SCRIPT: &str = r#"
-    // 1. Hide the webdriver flag
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+// ─── Persistent stealth scripts (Page.addScriptToEvaluateOnNewDocument) ───────
+// These fire before ANY page JS on every navigation, including cross-origin.
 
-    // 2. Restore window.chrome so chrome-detection checks pass
+/// Hides webdriver flag, restores window.chrome, spoofs permissions/plugins/languages,
+/// and forces shadow roots open so nothing hides inside closed shadows.
+/// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L380-L401
+const STEALTH_SCRIPT: &str = r#"
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.chrome = {
         runtime: {},
         app: {
-            InstallState: {
-                DISABLED: 'disabled',
-                INSTALLED: 'installed',
-                NOT_INSTALLED: 'not_installed'
-            },
-            RunningState: {
-                CANNOT_RUN: 'cannot_run',
-                READY_TO_RUN: 'ready_to_run',
-                RUNNING: 'running'
-            }
+            InstallState: { DISABLED:'disabled', INSTALLED:'installed', NOT_INSTALLED:'not_installed' },
+            RunningState: { CANNOT_RUN:'cannot_run', READY_TO_RUN:'ready_to_run', RUNNING:'running' }
         }
     };
-
-    // 3. Spoof the Permissions API for 'notifications'
     const _origQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = parameters => (
-        parameters.name === 'notifications'
+    window.navigator.permissions.query = p => (
+        p.name === 'notifications'
             ? Promise.resolve({ state: Notification.permission })
-            : _origQuery(parameters)
+            : _origQuery(p)
     );
-
-    // 4. Spoof plugins and languages
-    Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-    // 5. Shadow-root always open (mirrors SeleniumBase's _prepare_expert)
-    // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/connection.py#L491-L503
+    Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
     Element.prototype._attachShadow = Element.prototype.attachShadow;
-    Element.prototype.attachShadow  = function () {
-        return this._attachShadow({ mode: 'open' });
-    };
+    Element.prototype.attachShadow  = function() { return this._attachShadow({ mode:'open' }); };
 "#;
 
-// ─── Stealth: CDC prop scrubber ───────────────────────────────────────────────
+/// Deletes all chromedriver CDC artefact properties from window.
+/// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L388-L394
 const CDC_SCRUB_SCRIPT: &str = r#"
     (() => {
-        let obj = window, props = [];
-        while (obj !== null) {
-            props = props.concat(Object.getOwnPropertyNames(obj));
-            obj = Object.getPrototypeOf(obj);
-        }
-        props.filter(p => p.match(/^[a-z]{3}_[a-z]{22}_.*/i))
-             .forEach(p => delete window[p]);
+        let o = window, p = [];
+        while (o !== null) { p = p.concat(Object.getOwnPropertyNames(o)); o = Object.getPrototypeOf(o); }
+        p.filter(x => x.match(/^[a-z]{3}_[a-z]{22}_.*/i)).forEach(x => delete window[x]);
     })();
 "#;
 
-// ─── Stealth: Advanced fingerprint spoofing ───────────────────────────────────
-// Covers: Canvas, AudioContext, WebGL vendor/renderer, hardware concurrency,
-// device memory, and screen metrics.
-// Ref: https://github.com/nicksandford/puppeteer-extra-plugin-stealth (concepts)
+/// Canvas noise, AudioContext noise, WebGL vendor/renderer spoof,
+/// hardware concurrency, device memory, and screen metrics normalization.
 const ADVANCED_FINGERPRINT_SCRIPT: &str = r#"
     (() => {
-        // --- Canvas Fingerprint Noise ---
         const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
-        HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+        HTMLCanvasElement.prototype.toDataURL = function(type, q) {
             const ctx = this.getContext('2d');
             if (ctx) {
-                const id = ctx.getImageData(0, 0, this.width, this.height);
-                for (let i = 0; i < id.data.length; i += 4) {
-                    id.data[i]     += Math.floor(Math.random() * 2);
-                    id.data[i + 1] += Math.floor(Math.random() * 2);
-                    id.data[i + 2] += Math.floor(Math.random() * 2);
+                const id = ctx.getImageData(0,0,this.width,this.height);
+                for (let i=0;i<id.data.length;i+=4){
+                    id.data[i]  +=Math.floor(Math.random()*2);
+                    id.data[i+1]+=Math.floor(Math.random()*2);
+                    id.data[i+2]+=Math.floor(Math.random()*2);
                 }
-                ctx.putImageData(id, 0, 0);
+                ctx.putImageData(id,0,0);
             }
-            return _toDataURL.apply(this, arguments);
+            return _toDataURL.apply(this,arguments);
         };
-
-        // --- AudioContext Fingerprint Noise ---
-        const AC = window.AudioContext || window.webkitAudioContext;
+        const AC = window.AudioContext||window.webkitAudioContext;
         if (AC) {
-            const _createAnalyser = AC.prototype.createAnalyser;
+            const _ca = AC.prototype.createAnalyser;
             AC.prototype.createAnalyser = function() {
-                const node = _createAnalyser.apply(this, arguments);
-                const _gffd = node.getFloatFrequencyData.bind(node);
-                node.getFloatFrequencyData = function(arr) {
-                    _gffd(arr);
-                    for (let i = 0; i < arr.length; i++) {
-                        arr[i] += (Math.random() * 0.0002) - 0.0001;
-                    }
-                };
-                return node;
+                const n=_ca.apply(this,arguments);
+                const _g=n.getFloatFrequencyData.bind(n);
+                n.getFloatFrequencyData=function(a){_g(a);for(let i=0;i<a.length;i++)a[i]+=(Math.random()*0.0002)-0.0001;};
+                return n;
             };
         }
-
-        // --- WebGL Vendor / Renderer Spoof ---
-        const _getParam = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(p) {
-            if (p === 37445) return 'Intel Inc.';
-            if (p === 37446) return 'Intel Iris OpenGL Engine';
-            return _getParam.apply(this, arguments);
+        const _gp=WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter=function(p){
+            if(p===37445)return 'Intel Inc.';
+            if(p===37446)return 'Intel Iris OpenGL Engine';
+            return _gp.apply(this,arguments);
         };
-        if (typeof WebGL2RenderingContext !== 'undefined') {
-            const _getParam2 = WebGL2RenderingContext.prototype.getParameter;
-            WebGL2RenderingContext.prototype.getParameter = function(p) {
-                if (p === 37445) return 'Intel Inc.';
-                if (p === 37446) return 'Intel Iris OpenGL Engine';
-                return _getParam2.apply(this, arguments);
+        if(typeof WebGL2RenderingContext!=='undefined'){
+            const _gp2=WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter=function(p){
+                if(p===37445)return 'Intel Inc.';
+                if(p===37446)return 'Intel Iris OpenGL Engine';
+                return _gp2.apply(this,arguments);
             };
         }
-
-        // --- Hardware Concurrency + Device Memory ---
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
-
-        // --- Screen Metrics ---
-        Object.defineProperty(screen, 'width',       { get: () => 1920 });
-        Object.defineProperty(screen, 'height',      { get: () => 1080 });
-        Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
-        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-        Object.defineProperty(screen, 'colorDepth',  { get: () => 24   });
-        Object.defineProperty(screen, 'pixelDepth',  { get: () => 24   });
+        Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>8});
+        Object.defineProperty(navigator,'deviceMemory',       {get:()=>8});
+        Object.defineProperty(screen,'width',      {get:()=>1920});
+        Object.defineProperty(screen,'height',     {get:()=>1080});
+        Object.defineProperty(screen,'availWidth', {get:()=>1920});
+        Object.defineProperty(screen,'availHeight',{get:()=>1040});
+        Object.defineProperty(screen,'colorDepth', {get:()=>24});
+        Object.defineProperty(screen,'pixelDepth', {get:()=>24});
     })();
 "#;
 
-// ─── Internal: inject all persistent CDP stealth hooks ───────────────────────
+// ─── Internal: register all three persistent hooks via CDP ───────────────────
+
 async fn inject_all_persistent_stealth(driver: &WebDriver) -> Result<(), Box<dyn Error>> {
-    let dev_tools = ChromeDevTools::new(driver.handle.clone());
-
-    // 1. Basic navigator / chrome / permissions / shadow-root spoof
-    dev_tools
-        .execute_cdp_with_params(
+    let dt = ChromeDevTools::new(driver.handle.clone());
+    for src in [STEALTH_SCRIPT, CDC_SCRUB_SCRIPT, ADVANCED_FINGERPRINT_SCRIPT] {
+        dt.execute_cdp_with_params(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": STEALTH_SCRIPT }),
+            json!({ "source": src }),
         )
-        .await?;
-
-    // 2. CDC prop scrubber (runs before any page JS on every navigation)
-    // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L388-L394
-    dev_tools
-        .execute_cdp_with_params(
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": CDC_SCRUB_SCRIPT }),
-        )
-        .await?;
-
-    // 3. Advanced canvas / audio / WebGL / hardware fingerprint spoofing
-    dev_tools
-        .execute_cdp_with_params(
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": ADVANCED_FINGERPRINT_SCRIPT }),
-        )
-        .await?;
-
+            .await?;
+    }
     Ok(())
 }
 
@@ -211,24 +158,19 @@ pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
 
     let driver = connect_to_driver(port).await?;
 
-    // Inject all persistent stealth hooks via CDP
     inject_all_persistent_stealth(&driver).await?;
 
-    // Grant all permissions so no browser prompts appear during automation.
-    // Prompts are a detectable automation signal.
+    // Grant all permissions upfront — permission prompts are a bot-detection signal.
     // Ref: https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-grantPermissions
-    let dev_tools = ChromeDevTools::new(driver.handle.clone());
-    let _ = dev_tools
+    let _ = ChromeDevTools::new(driver.handle.clone())
         .execute_cdp_with_params(
             "Browser.grantPermissions",
             json!({
                 "permissions": [
-                    "geolocation", "notifications", "audioCapture",
-                    "videoCapture", "clipboardReadWrite",
-                    "clipboardSanitizedWrite", "midi", "midiSysex",
-                    "sensors", "backgroundSync", "backgroundFetch",
-                    "nfc", "displayCapture", "storageAccess",
-                    "protectedMediaIdentifier", "idleDetection"
+                    "geolocation","notifications","audioCapture","videoCapture",
+                    "clipboardReadWrite","clipboardSanitizedWrite","midi","midiSysex",
+                    "sensors","backgroundSync","backgroundFetch","nfc","displayCapture",
+                    "storageAccess","protectedMediaIdentifier","idleDetection"
                 ]
             }),
         )
@@ -237,33 +179,83 @@ pub async fn chrome() -> Result<WebDriver, Box<dyn Error>> {
     Ok(driver)
 }
 
-// ─── Chrome trait ───────────────────────────────────��─────────────────────────
+// ─── Public free functions ────────────────────────────────────────────────────
+
+/// Canonical CF/bot bypass: window.open in new tab → full quit → sleep → reconnect.
+/// This is the gold-standard pattern from SeleniumBase UC Mode.
+/// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L587-L633
+pub async fn uc_open_with_reconnect(
+    driver: &WebDriver,
+    url: &str,
+    port: usize,
+    caps: thirtyfour::ChromeCapabilities,
+    reconnect_secs: f64,
+) -> Result<WebDriver, Box<dyn Error>> {
+    let _ = driver
+        .execute(&format!(r#"window.open("{}","_blank");"#, url), vec![])
+        .await;
+    let _ = driver.clone().quit().await;
+    time::sleep(Duration::from_secs_f64(reconnect_secs)).await;
+    for _ in 0..20 {
+        if let Ok(d) = WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await {
+            inject_all_persistent_stealth(&d).await?;
+            let handles = d.windows().await.unwrap_or_default();
+            if let Some(last) = handles.last() {
+                let _ = d.switch_to_window(last.clone()).await;
+            }
+            return Ok(d);
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+    Err("Failed to reconnect WebDriver".into())
+}
+
+// ─── Chrome trait ─────────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
 pub trait Chrome {
-    // ── Stealth helpers ──────────────────────────────────────────────────────
+    // ── Stealth ──────────────────────────────────────────────────────────────
 
     /// Scrub CDC props from the current page context (runtime, not persistent).
     async fn remove_cdc_props(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Re-inject all persistent CDP stealth hooks (call after manual reconnect).
+    /// Re-inject all persistent CDP stealth hooks (call after a manual reconnect).
     async fn inject_persistent_stealth(&self) -> Result<(), Box<dyn Error>>;
 
-    // ── Navigation ───────────────────────────────────────────────────────────
+    // ── Lifecycle ────────────────────────────────────────────────────────────
 
-    /// Create a new stealthed driver instance.
+    /// Create a new fully stealthed driver instance.
     async fn new() -> Self;
+
+    // ── Navigation ───────────────────────────────────────────────────────────
 
     /// Navigate with pre/post CDC scrub.
     async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Alias for goto — explicit scrub-navigate-scrub pattern.
+    /// Alias for goto — explicit scrub-navigate-scrub.
     async fn uc_get(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Open URL in a new tab, close the original.
-    /// Avoids direct navigation fingerprinting.
-    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L577-L591
+    /// Open URL in a new tab, close the original tab.
+    /// Avoids direct-navigation fingerprinting.
+    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L561-L576
     async fn uc_open_with_tab(&self, url: &str) -> Result<(), Box<dyn Error>>;
+
+    /// Open url in new tab → drop WebDriver connection → sleep → reconnect.
+    /// Lighter than uc_open_with_reconnect (chromedriver process stays alive).
+    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L634-L662
+    async fn uc_open_with_disconnect(
+        &self,
+        url: &str,
+        timeout_secs: f64,
+        port: usize,
+        caps: thirtyfour::ChromeCapabilities,
+    ) -> Result<WebDriver, Box<dyn Error>>;
+
+    /// Navigate back in history with pre/post CDC scrub.
+    async fn go_back(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Navigate forward in history with pre/post CDC scrub.
+    async fn go_forward(&self) -> Result<(), Box<dyn Error>>;
 
     // ── Interaction ──────────────────────────────────────────────────────────
 
@@ -271,18 +263,37 @@ pub trait Chrome {
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/browser_launcher.py#L655
     async fn uc_click(&self, css_selector: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Bypass a Cloudflare Turnstile challenge.
+    /// Bypass a Cloudflare Turnstile challenge at the given URL.
     async fn bypass_cloudflare(&self, url: &str) -> Result<(), Box<dyn Error>>;
+
+    // ── DOM helpers ──────────────────────────────────────────────────────────
+
+    /// Returns the full page HTML (outerHTML of <html>).
+    async fn get_page_source(&self) -> Result<String, Box<dyn Error>>;
+
+    /// Returns true if the CSS selector matches any element in the DOM.
+    async fn is_element_present(&self, css_selector: &str) -> bool;
+
+    /// Returns true if the CSS selector matches a visible (non-zero-size) element.
+    async fn is_element_visible(&self, css_selector: &str) -> bool;
+
+    /// Rewrites all target="_blank" links to target="_self".
+    /// Stops new-tab navigations from leaking automation signals.
+    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/core/sb_cdp.py#L1736-L1738
+    async fn internalize_links(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Opens a new browser window at the given URL.
+    /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L421-L428
+    async fn window_new(&self, url: &str) -> Result<(), Box<dyn Error>>;
 
     // ── CDP overrides ────────────────────────────────────────────────────────
 
-    /// Override User-Agent at the CDP/network layer.
-    /// Survives both JS navigator.userAgent checks AND HTTP request headers.
+    /// Override User-Agent at the CDP Network layer.
+    /// Survives both JS navigator.userAgent checks and HTTP request headers.
     /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride
     async fn set_user_agent(&self, ua: &str) -> Result<(), Box<dyn Error>>;
 
-    /// Spoof timezone + geolocation via CDP.
-    /// Mirrors SeleniumBase's set_timezone + set_geolocation.
+    /// Spoof timezone + geolocation via CDP Emulation domain.
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/cdp_driver/connection.py#L330-L348
     async fn set_timezone_and_geolocation(
         &self,
@@ -301,12 +312,31 @@ pub trait Chrome {
     /// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L175-L183
     async fn enable_cdp_log_capture(&self) -> Result<(), Box<dyn Error>>;
 
-    /// Take a lossless PNG screenshot via CDP.
+    /// Take a lossless PNG screenshot via CDP Page.captureScreenshot.
     /// Works in headless and offscreen modes.
     /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-captureScreenshot
     async fn cdp_screenshot(&self) -> Result<Vec<u8>, Box<dyn Error>>;
 
-    // Internal borrow helper
+    // ── Cookies ───────────────────────���──────────────────────────────────────
+
+    /// Get all cookies as a JSON array via CDP Network.getAllCookies.
+    async fn get_all_cookies(&self) -> Result<Value, Box<dyn Error>>;
+
+    /// Set cookies from a JSON array previously returned by get_all_cookies().
+    async fn set_all_cookies(&self, cookies: &Value) -> Result<(), Box<dyn Error>>;
+
+    /// Clear all cookies via CDP Network.clearBrowserCookies.
+    async fn clear_cookies(&self) -> Result<(), Box<dyn Error>>;
+
+    // ── Proxy ────────────────────────────────────────────────────────────────
+
+    /// Inject Proxy-Authorization at the CDP Network layer.
+    /// Handles authenticated proxies ("user:pass@host:port") after driver start.
+    /// Ref: https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setExtraHTTPHeaders
+    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>>;
+
+    // ── Internal ─────────────────────────────────────────────────────────────
+
     async fn borrow(&self) -> &WebDriver;
 }
 
@@ -332,34 +362,28 @@ impl Chrome for WebDriver {
 
     // ── goto ──────────────────────────────────────────────────────────────────
     async fn goto(&self, url: &str) -> Result<(), Box<dyn Error>> {
-        // Scrub current page before navigating (mirrors Python's get() hook)
         let _ = self.remove_cdc_props().await;
-
-        // Check for any live CDC props and delete them before navigation
-        let check_script = r#"
-            let obj = window, props = [];
-            while (obj !== null) {
-                props = props.concat(Object.getOwnPropertyNames(obj));
-                obj = Object.getPrototypeOf(obj);
-            }
-            return props.filter(p => p.match(/^[a-z]{3}_[a-z]{22}_.*/i));
+        // Check for live CDC props and delete them before navigating
+        // Mirrors Python's _get_cdc_props + _hook_remove_cdc_props
+        // Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L365-L394
+        let check = r#"
+            let o=window,r=[];
+            while(o!==null){r=r.concat(Object.getOwnPropertyNames(o));o=Object.getPrototypeOf(o);}
+            return r.filter(p=>p.match(/^[a-z]{3}_[a-z]{22}_.*/i));
         "#;
-
-        if let Ok(result) = self.execute(check_script, vec![]).await {
-            if let Some(arr) = result.json().as_array() {
+        if let Ok(res) = self.execute(check, vec![]).await {
+            if let Some(arr) = res.json().as_array() {
                 if !arr.is_empty() {
-                    if let Ok(props_json) = serde_json::to_string(arr) {
-                        let scrub = format!("{}.forEach(p => delete window[p]);", props_json);
-                        let _ = self.execute(&scrub, vec![]).await;
+                    if let Ok(j) = serde_json::to_string(arr) {
+                        let _ = self
+                            .execute(&format!("{}.forEach(p=>delete window[p]);", j), vec![])
+                            .await;
                         time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
         }
-
         self.get(url).await?;
-
-        // Scrub the freshly loaded page
         let _ = self.remove_cdc_props().await;
         Ok(())
     }
@@ -371,40 +395,86 @@ impl Chrome for WebDriver {
 
     // ── uc_open_with_tab ──────────────────────────────────────────────────────
     async fn uc_open_with_tab(&self, url: &str) -> Result<(), Box<dyn Error>> {
-        // Open in a new tab via window.open to avoid direct-navigation fingerprint
-        self.execute(&format!(r#"window.open("{}", "_blank");"#, url), vec![])
+        let _ = self.remove_cdc_props().await;
+        self.execute(&format!(r#"window.open("{}","_blank");"#, url), vec![])
             .await?;
-
         time::sleep(Duration::from_millis(500)).await;
-
         // Close the original tab
         let handles = self.windows().await?;
         if let Some(original) = handles.first() {
             self.switch_to_window(original.clone()).await?;
             self.close_window().await?;
         }
-
         // Switch to new tab
         let handles = self.windows().await?;
-        if let Some(new_tab) = handles.last() {
-            self.switch_to_window(new_tab.clone()).await?;
+        if let Some(last) = handles.last() {
+            self.switch_to_window(last.clone()).await?;
         }
+        let _ = self.remove_cdc_props().await;
+        Ok(())
+    }
 
+    // ── uc_open_with_disconnect ───────────────────────────────────────────────
+    // Opens url in new tab then reconnects after timeout_secs.
+    // chromedriver process stays alive — only the WebDriver session is dropped.
+    async fn uc_open_with_disconnect(
+        &self,
+        url: &str,
+        timeout_secs: f64,
+        port: usize,
+        caps: thirtyfour::ChromeCapabilities,
+    ) -> Result<WebDriver, Box<dyn Error>> {
+        let _ = self.remove_cdc_props().await;
+        let _ = self
+            .execute(&format!(r#"window.open("{}","_blank");"#, url), vec![])
+            .await;
+        // Quit just the session (the chromedriver process keeps running on `port`)
+        let _ = self.clone().quit().await;
+        time::sleep(Duration::from_secs_f64(timeout_secs)).await;
+        for _ in 0..20 {
+            if let Ok(d) =
+                WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await
+            {
+                let handles = d.windows().await.unwrap_or_default();
+                if let Some(last) = handles.last() {
+                    let _ = d.switch_to_window(last.clone()).await;
+                }
+                inject_all_persistent_stealth(&d).await?;
+                return Ok(d);
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+        Err("Failed to reconnect after disconnect".into())
+    }
+
+    // ── go_back ───────────────────────────────────────────────────────────────
+    async fn go_back(&self) -> Result<(), Box<dyn Error>> {
+        let _ = self.remove_cdc_props().await;
+        self.execute("window.history.back();", vec![]).await?;
+        time::sleep(Duration::from_millis(300)).await;
+        let _ = self.remove_cdc_props().await;
+        Ok(())
+    }
+
+    // ── go_forward ────────────────────────────────────────────────────────────
+    async fn go_forward(&self) -> Result<(), Box<dyn Error>> {
+        let _ = self.remove_cdc_props().await;
+        self.execute("window.history.forward();", vec![]).await?;
+        time::sleep(Duration::from_millis(300)).await;
         let _ = self.remove_cdc_props().await;
         Ok(())
     }
 
     // ── uc_click ──────────────────────────────────────────────────────────────
     async fn uc_click(&self, css_selector: &str) -> Result<(), Box<dyn Error>> {
-        // 111 ms delayed click — mirrors Python's js_utils.call_me_later
         self.execute(
             &format!(
-                "setTimeout(() => document.querySelector('{}').click(), 111);",
+                "setTimeout(()=>document.querySelector('{}').click(),111);",
                 css_selector
             ),
             vec![],
         )
-        .await?;
+            .await?;
         time::sleep(Duration::from_millis(150)).await;
         Ok(())
     }
@@ -413,9 +483,10 @@ impl Chrome for WebDriver {
     async fn bypass_cloudflare(&self, url: &str) -> Result<(), Box<dyn Error>> {
         self.goto(url).await?;
         self.enter_frame(0).await?;
-
         let button = self
-            .find(By::XPath("/html/body//div/div[1]/div[1]/div/label/input"))
+            .find(By::XPath(
+                "/html/body//div/div[1]/div[1]/div/label/input",
+            ))
             .await?;
         button.wait_until().clickable().await?;
         time::sleep(Duration::from_secs(2)).await;
@@ -423,10 +494,67 @@ impl Chrome for WebDriver {
         Ok(())
     }
 
-    // ── set_user_agent ────────────────────────────────────────────────────────
+    // ── get_page_source ───────────────────────────────────────────────────────
+    async fn get_page_source(&self) -> Result<String, Box<dyn Error>> {
+        let r = self
+            .execute("return document.documentElement.outerHTML;", vec![])
+            .await?;
+        Ok(r.json().as_str().unwrap_or("").to_string())
+    }
+
+    // ── is_element_present ────────────────────────────────────────────────────
+    async fn is_element_present(&self, css_selector: &str) -> bool {
+        self.find(By::Css(css_selector)).await.is_ok()
+    }
+
+    // ── is_element_visible ────────────────────────────────────────────────────
+    async fn is_element_visible(&self, css_selector: &str) -> bool {
+        let script = format!(
+            "const e=document.querySelector('{}');if(!e)return false;\
+             const r=e.getBoundingClientRect();return r.width>0&&r.height>0;",
+            css_selector
+        );
+        self.execute(&script, vec![])
+            .await
+            .ok()
+            .and_then(|r| r.json().as_bool())
+            .unwrap_or(false)
+    }
+
+    // ── internalize_links ─────────────────────────────────────────────────────
+    async fn internalize_links(&self) -> Result<(), Box<dyn Error>> {
+        self.execute(
+            r#"document.querySelectorAll('[target="_blank"]')
+               .forEach(e=>e.setAttribute('target','_self'));"#,
+            vec![],
+        )
+            .await?;
+        Ok(())
+    }
+
+    // ── window_new ────────────────────────────────────────────────────────────
+    async fn window_new(&self, url: &str) -> Result<(), Box<dyn Error>> {
+        let _ = self.remove_cdc_props().await;
+        self.execute(
+            &format!(
+                r#"window.open("{}","_blank","location=yes,height=768,width=1024,scrollbars=yes,status=yes");"#,
+                url
+            ),
+            vec![],
+        )
+            .await?;
+        time::sleep(Duration::from_millis(300)).await;
+        let handles = self.windows().await?;
+        if let Some(last) = handles.last() {
+            self.switch_to_window(last.clone()).await?;
+        }
+        let _ = self.remove_cdc_props().await;
+        Ok(())
+    }
+
+    // ── set_user_agent ─────���──────────────────────────────────────────────────
     async fn set_user_agent(&self, ua: &str) -> Result<(), Box<dyn Error>> {
-        let dev_tools = ChromeDevTools::new(self.handle.clone());
-        dev_tools
+        ChromeDevTools::new(self.handle.clone())
             .execute_cdp_with_params(
                 "Network.setUserAgentOverride",
                 json!({
@@ -447,45 +575,31 @@ impl Chrome for WebDriver {
         longitude: f64,
         accuracy: f64,
     ) -> Result<(), Box<dyn Error>> {
-        let dev_tools = ChromeDevTools::new(self.handle.clone());
-
-        // Ref: https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setTimezoneOverride
-        dev_tools
-            .execute_cdp_with_params(
-                "Emulation.setTimezoneOverride",
-                json!({ "timezoneId": timezone_id }),
-            )
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp_with_params(
+            "Emulation.setTimezoneOverride",
+            json!({ "timezoneId": timezone_id }),
+        )
             .await?;
-
-        // Ref: https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setGeolocationOverride
-        dev_tools
-            .execute_cdp_with_params(
-                "Emulation.setGeolocationOverride",
-                json!({
-                    "latitude":  latitude,
-                    "longitude": longitude,
-                    "accuracy":  accuracy
-                }),
-            )
+        dt.execute_cdp_with_params(
+            "Emulation.setGeolocationOverride",
+            json!({ "latitude": latitude, "longitude": longitude, "accuracy": accuracy }),
+        )
             .await?;
-
         Ok(())
     }
 
     // ── grant_all_permissions ─────────────────────────────────────────────────
     async fn grant_all_permissions(&self) -> Result<(), Box<dyn Error>> {
-        let dev_tools = ChromeDevTools::new(self.handle.clone());
-        dev_tools
+        ChromeDevTools::new(self.handle.clone())
             .execute_cdp_with_params(
                 "Browser.grantPermissions",
                 json!({
                     "permissions": [
-                        "geolocation", "notifications", "audioCapture",
-                        "videoCapture", "clipboardReadWrite",
-                        "clipboardSanitizedWrite", "midi", "midiSysex",
-                        "sensors", "backgroundSync", "backgroundFetch",
-                        "nfc", "displayCapture", "storageAccess",
-                        "protectedMediaIdentifier", "idleDetection"
+                        "geolocation","notifications","audioCapture","videoCapture",
+                        "clipboardReadWrite","clipboardSanitizedWrite","midi","midiSysex",
+                        "sensors","backgroundSync","backgroundFetch","nfc","displayCapture",
+                        "storageAccess","protectedMediaIdentifier","idleDetection"
                     ]
                 }),
             )
@@ -495,68 +609,71 @@ impl Chrome for WebDriver {
 
     // ── enable_cdp_log_capture ────────────────────────────────────────────────
     async fn enable_cdp_log_capture(&self) -> Result<(), Box<dyn Error>> {
-        let dev_tools = ChromeDevTools::new(self.handle.clone());
-        // Enable Network domain so requestWillBeSent etc. fire
-        dev_tools.execute_cdp("Network.enable").await?;
-        // Enable the Log domain (browser console + network errors)
-        dev_tools
-            .execute_cdp_with_params("Log.enable", json!({}))
-            .await?;
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp("Network.enable").await?;
+        dt.execute_cdp_with_params("Log.enable", json!({})).await?;
         Ok(())
     }
 
     // ── cdp_screenshot ────────────────────────────────────────────────────────
     async fn cdp_screenshot(&self) -> Result<Vec<u8>, Box<dyn Error>> {
-        let dev_tools = ChromeDevTools::new(self.handle.clone());
-        let result = dev_tools
+        let r = ChromeDevTools::new(self.handle.clone())
             .execute_cdp_with_params(
                 "Page.captureScreenshot",
                 json!({ "format": "png", "fromSurface": true }),
             )
             .await?;
-
-        let b64 = result["data"].as_str().ok_or("Missing screenshot data")?;
+        let b64 = r["data"].as_str().ok_or("Missing screenshot data")?;
         Ok(general_purpose::STANDARD.decode(b64)?)
+    }
+
+    // ── get_all_cookies ───────────────────────────────────────────────────────
+    async fn get_all_cookies(&self) -> Result<Value, Box<dyn Error>> {
+        let r = ChromeDevTools::new(self.handle.clone())
+            .execute_cdp_with_params("Network.getAllCookies", json!({}))
+            .await?;
+        Ok(r["cookies"].clone())
+    }
+
+    // ── set_all_cookies ───────────────────────────────────────────────────────
+    async fn set_all_cookies(&self, cookies: &Value) -> Result<(), Box<dyn Error>> {
+        let dt = ChromeDevTools::new(self.handle.clone());
+        if let Some(arr) = cookies.as_array() {
+            for c in arr {
+                let _ = dt.execute_cdp_with_params("Network.setCookie", c.clone()).await;
+            }
+        }
+        Ok(())
+    }
+
+    // ── clear_cookies ─────────────────────────────────────────────────────────
+    async fn clear_cookies(&self) -> Result<(), Box<dyn Error>> {
+        ChromeDevTools::new(self.handle.clone())
+            .execute_cdp_with_params("Network.clearBrowserCookies", json!({}))
+            .await?;
+        Ok(())
+    }
+
+    // ── set_proxy ��────────────────────────────────────────────────────────────
+    async fn set_proxy(&self, proxy: &str) -> Result<(), Box<dyn Error>> {
+        let dt = ChromeDevTools::new(self.handle.clone());
+        dt.execute_cdp("Network.enable").await?;
+        if proxy.contains('@') {
+            let creds = proxy.split('@').next().unwrap_or("");
+            let encoded = general_purpose::STANDARD.encode(creds);
+            dt.execute_cdp_with_params(
+                "Network.setExtraHTTPHeaders",
+                json!({ "headers": { "Proxy-Authorization": format!("Basic {}", encoded) } }),
+            )
+                .await?;
+        }
+        Ok(())
     }
 
     // ── borrow ────────────────────────────────────────────────────────────────
     async fn borrow(&self) -> &WebDriver {
         self
     }
-}
-
-// ─── Public reconnect helper ──────────────────────────────────────────────────
-// Mirrors Python's reconnect() — the gold standard for bypassing Cloudflare
-// Turnstile and heavy bot detection.
-// Ref: https://github.com/seleniumbase/SeleniumBase/blob/main/seleniumbase/undetected/__init__.py#L503-L555
-//
-// Usage:
-//   let driver = uc_reconnect(&driver, port, caps.clone(), 4.0).await?;
-pub async fn uc_reconnect(
-    driver: &WebDriver,
-    port: usize,
-    caps: thirtyfour::ChromeCapabilities,
-    reconnect_secs: f64,
-) -> Result<WebDriver, Box<dyn Error>> {
-    // 1. Quit the current session (drops chromedriver connection)
-    let _ = driver.clone().quit().await;
-
-    // 2. Sleep — the anti-bot detection window
-    time::sleep(Duration::from_secs_f64(reconnect_secs)).await;
-
-    // 3. Reconnect to the already-running chromedriver process
-    for _ in 0..20 {
-        if let Ok(new_driver) =
-            WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await
-        {
-            // Re-inject all persistent stealth hooks on the fresh session
-            inject_all_persistent_stealth(&new_driver).await?;
-            return Ok(new_driver);
-        }
-        time::sleep(Duration::from_millis(250)).await;
-    }
-
-    Err("Failed to reconnect WebDriver".into())
 }
 
 // ─── Driver internals ─────────────────────────────────────────────────────────
@@ -566,23 +683,21 @@ fn patch_chromedriver() -> Result<(), Box<dyn Error>> {
     let file_content = fs::read(DRIVER_NAME)?;
     let mut new_content = file_content.clone();
     let mut patch_count = 0;
-
     for i in 0..file_content.len().saturating_sub(3) {
         if &file_content[i..i + 4] == b"cdc_" {
             let mut rng = rand::rng();
             for x in i + 4..i + 22 {
-                new_content[x] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    [rng.random_range(0..52)];
+                new_content[x] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        [rng.random_range(0..52)];
             }
             patch_count += 1;
         }
     }
-
     match patch_count {
         0 => println!("No cdcs were found!"),
         n => println!("Patched {} cdcs!", n),
     }
-
     fs::write(PATCHED_DRIVER_NAME, new_content)?;
     println!(
         "Successfully wrote patched executable to '{}'!",
@@ -599,14 +714,16 @@ fn setup_driver_permissions() -> Result<(), Box<dyn Error>> {
         perms.set_mode(0o755);
         fs::set_permissions(PATCHED_DRIVER_NAME, perms)?;
     }
-
     #[cfg(target_os = "macos")]
     {
         let out = Command::new("codesign")
             .args(&["--force", "--sign", "-", PATCHED_DRIVER_NAME])
             .output()?;
         if !out.status.success() {
-            eprintln!("codesign failed: {}", String::from_utf8_lossy(&out.stderr));
+            eprintln!(
+                "codesign failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
     Ok(())
@@ -616,13 +733,10 @@ fn start_driver_process(port: usize) -> Result<(), Box<dyn Error>> {
     println!("Starting detached chromedriver on port {}...", port);
     let mut cmd = Command::new(format!("./{}", PATCHED_DRIVER_NAME));
     cmd.arg(format!("--port={}", port));
-
     #[cfg(target_family = "unix")]
     cmd.process_group(0);
-
     #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x00000008); // DETACHED_PROCESS
-
+    cmd.creation_flags(0x00000008);
     cmd.spawn()?;
     Ok(())
 }
@@ -654,7 +768,6 @@ fn merge_json(a: &mut Value, b: Value) {
 async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
     let mut caps = DesiredCapabilities::chrome();
 
-    // Core stealth args
     caps.set_no_sandbox()?;
     caps.set_disable_dev_shm_usage()?;
     caps.add_arg("--disable-blink-features=AutomationControlled")?;
@@ -676,13 +789,13 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
     caps.add_arg("--disable-popup-blocking")?;
     caps.add_arg("--disable-translate")?;
     caps.add_arg("--disable-search-engine-choice-screen")?;
+    caps.add_arg("--enable-unsafe-extension-debugging")?;
     caps.add_arg("--lang=en-US,en;q=0.9")?;
     caps.add_arg("--disable-background-timer-throttling")?;
     caps.add_arg("--disable-backgrounding-occluded-windows")?;
     caps.add_arg("--disable-renderer-backgrounding")?;
     caps.add_arg("--disable-features=IsolateOrigins,site-per-process,Translate,InsecureDownloadWarnings,DownloadBubble,DownloadBubbleV2,OptimizationTargetPrediction,OptimizationGuideModelDownloading,SidePanelPinning,UserAgentClientHint,PrivacySandboxSettings4,ComponentUpdater")?;
 
-    // OS-specific UA (also overridable at runtime via set_user_agent())
     let os = std::env::consts::OS;
     let user_agent = match os {
         "windows" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -691,34 +804,26 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
     };
     caps.add_arg(&format!("--user-agent={}", user_agent))?;
 
-    // Temp profile (avoids wire-fingerprinting)
+    // Temp profile — avoids wire-fingerprinting from reused profiles
     let temp_dir = tempfile::Builder::new().prefix("uc_").tempdir()?;
     let profile_path = temp_dir.path().to_path_buf();
     caps.add_arg(&format!("--user-data-dir={}", profile_path.display()))?;
 
-    // Write Preferences directly to disk before Chrome starts
+    // Write stealth Preferences directly to disk before Chrome reads them
     let default_path = profile_path.join("Default");
     fs::create_dir_all(&default_path)?;
     let prefs_file = default_path.join("Preferences");
 
     let mut stealth_prefs = Value::Object(Map::new());
     if let Value::Object(ref mut map) = stealth_prefs {
-        insert_nested_pref(map, "credentials_enable_service", Value::Bool(false));
-        insert_nested_pref(map, "profile.password_manager_enabled", Value::Bool(false));
-        insert_nested_pref(
-            map,
-            "profile.password_manager_leak_detection",
-            Value::Bool(false),
-        );
-        insert_nested_pref(map, "profile.exit_type", Value::Null);
+        insert_nested_pref(map, "credentials_enable_service",              Value::Bool(false));
+        insert_nested_pref(map, "profile.password_manager_enabled",        Value::Bool(false));
+        insert_nested_pref(map, "profile.password_manager_leak_detection", Value::Bool(false));
+        insert_nested_pref(map, "profile.exit_type",                       Value::Null);
         // WebRTC leak prevention
-        insert_nested_pref(
-            map,
-            "webrtc.ip_handling_policy",
-            Value::String("disable_non_proxied_udp".into()),
-        );
+        insert_nested_pref(map, "webrtc.ip_handling_policy",    Value::String("disable_non_proxied_udp".into()));
         insert_nested_pref(map, "webrtc.multiple_routes_enabled", Value::Bool(false));
-        insert_nested_pref(map, "webrtc.nonproxied_udp_enabled", Value::Bool(false));
+        insert_nested_pref(map, "webrtc.nonproxied_udp_enabled",  Value::Bool(false));
     }
 
     if prefs_file.exists() {
@@ -731,26 +836,24 @@ async fn connect_to_driver(port: usize) -> Result<WebDriver, Box<dyn Error>> {
     }
     fs::write(&prefs_file, serde_json::to_string(&stealth_prefs)?)?;
 
-    // Connection retry loop
     for _ in 0..20 {
         if let Ok(driver) =
             WebDriver::new(&format!("http://localhost:{}", port), caps.clone()).await
         {
-            let _ = temp_dir.into_path(); // keep profile alive
+            let _ = temp_dir.into_path(); // keep profile alive for the session
             return Ok(driver);
         }
         time::sleep(Duration::from_millis(250)).await;
     }
-
     Err("Failed to create WebDriver".into())
 }
 
 // ─── ChromeDriver download ────────────────────────────────────────────────────
 
 async fn fetch_chromedriver() -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+    let client  = Client::new();
+    let os      = std::env::consts::OS;
+    let arch    = std::env::consts::ARCH;
     let version = get_chrome_version(os).await?;
 
     let url = if version.as_str() >= "114" {
@@ -763,18 +866,15 @@ async fn fetch_chromedriver() -> Result<(), Box<dyn Error>> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
 
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = file.mangled_name();
+        let mut file    = archive.by_index(i)?;
+        let outpath     = file.mangled_name();
         if file.name().ends_with('/') {
             fs::create_dir_all(&outpath)?;
         } else {
             if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
+                if !p.exists() { fs::create_dir_all(p)?; }
             }
-            let name = outpath.file_name().ok_or("Invalid file name")?;
-            let mut out = fs::File::create(name)?;
+            let mut out = fs::File::create(outpath.file_name().ok_or("Invalid file name")?)?;
             std::io::copy(&mut file, &mut out)?;
         }
     }
@@ -793,15 +893,13 @@ async fn get_new_chrome_url(
     let full = json["milestones"][version]["version"]
         .as_str()
         .ok_or("Version not found")?;
-
     let (platform, zip) = match (os, arch) {
-        ("linux", _) => ("linux64", "chromedriver-linux64.zip"),
-        ("windows", _) => ("win64", "chromedriver-win64.zip"),
-        ("macos", "aarch64") => ("mac-arm64", "chromedriver-mac-arm64.zip"),
-        ("macos", _) => ("mac-x64", "chromedriver-mac-x64.zip"),
+        ("linux",   _)         => ("linux64",   "chromedriver-linux64.zip"),
+        ("windows", _)         => ("win64",     "chromedriver-win64.zip"),
+        ("macos",   "aarch64") => ("mac-arm64", "chromedriver-mac-arm64.zip"),
+        ("macos",   _)         => ("mac-x64",   "chromedriver-mac-x64.zip"),
         _ => return Err("Unsupported OS".into()),
     };
-
     Ok(format!(
         "https://storage.googleapis.com/chrome-for-testing-public/{}/{}/{}",
         full, platform, zip
@@ -819,19 +917,14 @@ async fn get_legacy_chrome_url(
             "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{}",
             version
         ))
-        .send()
-        .await?
-        .text()
-        .await?;
-
+        .send().await?.text().await?;
     let zip = match (os, arch) {
-        ("linux", _) => "chromedriver_linux64.zip",
-        ("windows", _) => "chromedriver_win32.zip",
-        ("macos", "aarch64") => return Err("macOS Apple Silicon requires Chrome ≥114".into()),
-        ("macos", _) => "chromedriver_mac64.zip",
+        ("linux",   _)         => "chromedriver_linux64.zip",
+        ("windows", _)         => "chromedriver_win32.zip",
+        ("macos",   "aarch64") => return Err("macOS Apple Silicon requires Chrome ≥114".into()),
+        ("macos",   _)         => "chromedriver_mac64.zip",
         _ => return Err("Unsupported OS".into()),
     };
-
     Ok(format!(
         "https://chromedriver.storage.googleapis.com/{}/{}",
         latest, zip
@@ -842,11 +935,11 @@ async fn get_chrome_version(os: &str) -> Result<String, Box<dyn Error>> {
     println!("Getting installed Chrome version...");
     let out = match os {
         "linux" => Command::new("/usr/bin/google-chrome")
-            .arg("--version")
-            .output()?,
-        "macos" => Command::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-            .arg("--version")
-            .output()?,
+            .arg("--version").output()?,
+        "macos" => Command::new(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )
+            .arg("--version").output()?,
         "windows" => Command::new("powershell")
             .args(&[
                 "-c",
@@ -855,7 +948,6 @@ async fn get_chrome_version(os: &str) -> Result<String, Box<dyn Error>> {
             .output()?,
         _ => return Err("Unsupported OS".into()),
     };
-
     let version: String = String::from_utf8(out.stdout)?
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.')
@@ -863,11 +955,9 @@ async fn get_chrome_version(os: &str) -> Result<String, Box<dyn Error>> {
         .split('.')
         .take(1)
         .collect();
-
     if version.is_empty() {
         return Err("Could not determine Chrome version".into());
     }
-
     println!("Chrome version: {}", version);
     Ok(version)
 }
