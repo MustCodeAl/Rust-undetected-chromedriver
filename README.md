@@ -14,7 +14,7 @@ To use this library, you will need to have Rust and Cargo installed on your syst
 
 ```toml
 [dependencies]
-undetected-chromedriver = "0.1.2"
+undetected-chromedriver = "0.4.0"
 ```
 
 
@@ -23,7 +23,7 @@ undetected-chromedriver = "0.1.2"
 Here's an example of how you can use the undetected chromedriver in your Rust project:
 
 ```rust
-use undetected_chromedriver::chrome;
+use undetected_chromedriver::{chrome, Chrome};
 use tokio;
 
 #[tokio::main]
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     driver.goto("https://www.rust-lang.org/").await?;
 
-    let title = driver.title().await?;
+    let title = driver.get_title().await?;
     println!("Title: {}", title);
 
     driver.quit().await?;
@@ -40,6 +40,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### With configuration
+
+```rust
+use undetected_chromedriver::{chrome_with_config, Chrome, ChromeConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ChromeConfig {
+        headless: true,
+        ad_block: true,
+        ..Default::default()
+    };
+    let driver = chrome_with_config(config).await?;
+
+    driver.goto("https://www.rust-lang.org/").await?;
+    driver.quit().await?;
+
+    Ok(())
+}
+```
+
 *Note: chrome needs to be installed on the system before using undetected chromedriver*
 
 ### Headless mode
