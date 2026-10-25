@@ -7,7 +7,9 @@ A rust implementation of ultrafunkamsterdam's [undetected-chromedriver](https://
 
 
 TODO: add more detection bypasses and methods from [SeleniumBase UC Mode](https://seleniumbase.io/help_docs/uc_mode/)
+UPDATE: There is a full blown port of [SeleniumBase for rust](https://github.com/MustCodeAl/seleniumbase-rs)
 
+ 
 ## Installation
 
 To use this library, you will need to have Rust and Cargo installed on your system. You can then add the following line to your `Cargo.toml` file:
